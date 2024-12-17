@@ -1,12 +1,16 @@
 'use strict';
 
-import { FileSystemModel } from '../model/fileSystemModel.js';
+import { FileSystemModel, SIZE_OF_BLOCK } from '../model/fileSystemModel.js';
 import { FileDirectory } from '../emulatedStructures/fileDirectory.js';
 import { RegularFile } from '../emulatedStructures/regularFile.js';
 import { validateIsDirectory } from '../../utils/directoryHandlers/validateIsDirectory.js';
 import { validateIsRegularFile } from '../../utils/pathHandlers/validateIsRegularFile.js';
 import { validatePathExists } from '../../utils/pathHandlers/validatePathExists.js';
 import { validatePathDoesNotExist } from '../../utils/pathHandlers/validatePathDoesNotExist.js';
+import { FileDescriptor } from '../emulatedStructures/fileDescriptor.js';
+import { SymbolicLink } from '../emulatedStructures/SymbolicLink.js';
+
+export const MAX_SYMLINKS = 25;
 
 export class FileSystemEmulator {
   constructor () {
@@ -15,24 +19,40 @@ export class FileSystemEmulator {
     this.Cwd = this.fs.rootDirectory;
   }
 
-  getPathDescriptor (path, cwd) {
-    const normalizedPath = this._normalizePath(path);
-    if (!normalizedPath) return [null, null, ''];
+  getPathDescriptor (path, cwd, followSymlinks = true) {
+    const normalizedPath = this._normalizePath(path, this._getPathFromDescriptor(cwd));
 
     const { currentDir, parentDir, pathComponents } = this._initializePathState(normalizedPath, cwd);
 
     if (normalizedPath === '/') return [this.fs.rootDirectory, this.fs.rootDirectory, ''];
 
-    return this._resolvePathComponents(pathComponents, currentDir, parentDir);
+    const [parent, descriptor, lastComponent] = this._resolvePathComponents(pathComponents, currentDir, parentDir, 0, followSymlinks);
+
+    if (descriptor instanceof SymbolicLink) {
+      return [parent, descriptor, lastComponent];
+    }
+
+    return [parent, descriptor, lastComponent];
   }
 
-  _normalizePath (path) {
+  _normalizePath (path, currentDir = '') {
     path = path.trim().replace(/^['"]|['"]$/g, '');
-    if (typeof path !== 'string') {
-      console.error('Error: Path must be a string');
-      return null;
+
+    if (path.startsWith('/')) {
+      currentDir = '';
     }
-    return path;
+
+    const fullPath = (currentDir + '/' + path).replace(/\/+/g, '/');
+    const components = fullPath.split('/').filter(Boolean);
+    const normalizedComponents = [];
+
+    for (const component of components) {
+      if (component === '.') continue;
+      if (component === '..') normalizedComponents.pop();
+      else normalizedComponents.push(component);
+    }
+
+    return '/' + normalizedComponents.join('/');
   }
 
   _initializePathState (path, cwd) {
@@ -42,8 +62,12 @@ export class FileSystemEmulator {
     return { currentDir, parentDir, pathComponents };
   }
 
-  _resolvePathComponents (pathComponents, currentDir, parentDir) {
-    const name = pathComponents[pathComponents.length - 1];
+  _resolvePathComponents (pathComponents, currentDir, parentDir, symlinkCount = 0, followSymlinks = true) {
+    if (symlinkCount > MAX_SYMLINKS) {
+      console.error('Too many symbolic link levels, possible cycle detected.');
+      return [null, null, ''];
+    }
+
     let descriptor = null;
 
     for (let i = 0; i < pathComponents.length; i++) {
@@ -53,28 +77,34 @@ export class FileSystemEmulator {
 
       if (!descriptor) break;
 
-      const typeCheckResult = this._handleDescriptorType(descriptor, currentDir, i, pathComponents);
-      if (!typeCheckResult) return [null, null, ''];
+      if (descriptor instanceof SymbolicLink) {
+        if (followSymlinks) {
+          symlinkCount++;
 
-      currentDir = typeCheckResult;
+          const targetPath = this._normalizePath(descriptor.value, this._getPathFromDescriptor(currentDir));
+          const remainingComponents = pathComponents.slice(i + 1);
+          const fullNewPath = this._normalizePath(targetPath + '/' + remainingComponents.join('/'));
+
+          return this._resolvePathComponents(this._splitPath(fullNewPath), this.fs.rootDirectory, parentDir, symlinkCount, followSymlinks);
+        } else {
+          return [parentDir, descriptor, componentName];
+        }
+      }
+
+      if (descriptor instanceof FileDirectory) {
+        currentDir = descriptor;
+      } else if (descriptor instanceof RegularFile && i === pathComponents.length - 1) {
+        return [parentDir, descriptor, componentName];
+      } else {
+        throw new Error(`Invalid path component: '${ componentName }'`);
+      }
     }
 
-    return [parentDir, descriptor, name];
+    return [parentDir, descriptor, pathComponents[pathComponents.length - 1]];
   }
 
-  _handleDescriptorType (descriptor, currentDir, index, pathComponents) {
-    if (descriptor instanceof FileDirectory) {
-      return descriptor;
-    } else if (descriptor instanceof RegularFile) {
-      if (index !== pathComponents.length - 1) {
-        console.error(`Error: File '${ pathComponents[index] }' is not the final component in the path.`);
-        return null;
-      }
-    } else {
-      console.error(`Error: Invalid file type for '${ pathComponents[index] }'`);
-      return null;
-    }
-    return currentDir;
+  _splitPath (path) {
+    return this._normalizePath(path).split('/').filter(Boolean);
   }
 
   create (path) {
@@ -93,8 +123,10 @@ export class FileSystemEmulator {
   }
 
   _validatePathForCreation (path, cwd) {
-    const [parentDirectory, existingDescriptor, fileName] = this.getPathDescriptor(path, cwd);
-    validatePathDoesNotExist(parentDirectory, existingDescriptor, path);
+    const normalizedPath = this._normalizePath(path, this._getPathFromDescriptor(cwd));
+    const [parentDirectory, existingDescriptor, fileName] = this.getPathDescriptor(normalizedPath, this.fs.rootDirectory);
+
+    validatePathDoesNotExist(parentDirectory, existingDescriptor, normalizedPath);
     return [parentDirectory, fileName];
   }
 
@@ -105,24 +137,50 @@ export class FileSystemEmulator {
   link (sourcePath, targetPath) {
     console.log(`Creating hard link ${ targetPath } for ${ sourcePath }`);
     try {
-      const sourceInfo = this._validateSourcePath(sourcePath);
-      const targetInfo = this._validateTargetPath(targetPath);
-      this._createHardLink(targetInfo.parentDir, targetInfo.name, sourceInfo.descriptor);
+      const { parentDir, descriptor } = this._validateSourcePath(sourcePath);
+
+      if (descriptor instanceof FileDirectory) {
+        throw new Error('Cannot create a hard link for a directory.');
+      }
+
+      if (descriptor instanceof SymbolicLink) {
+        const targetInfo = this._validateTargetPath(targetPath);
+        this._createHardLink(targetInfo.parentDir, targetInfo.name, descriptor);
+        return;
+      }
+
+      if (descriptor instanceof RegularFile) {
+        const targetInfo = this._validateTargetPath(targetPath);
+        this._createHardLink(targetInfo.parentDir, targetInfo.name, descriptor);
+        return;
+      }
+
+      throw new Error(`Unsupported file type for hard link.`);
     } catch (error) {
       console.error(error.message);
     }
   }
 
   _validateSourcePath (sourcePath) {
-    const [parentDir, descriptor] = this.getPathDescriptor(sourcePath, this.Cwd);
+    const result = this.getPathDescriptor(sourcePath, this.Cwd, false);
+
+    if (!Array.isArray(result) || result.length < 2) {
+      throw new Error(`Invalid path descriptor for sourcePath: ${ sourcePath }`);
+    }
+
+    const [parentDir, descriptor] = result;
 
     validatePathExists(parentDir, descriptor, sourcePath);
+
+    if (descriptor instanceof FileDirectory) {
+      throw new Error(`Source path ${ sourcePath } is a directory. Hard links to directories are not allowed.`);
+    }
 
     return { parentDir, descriptor };
   }
 
   _validateTargetPath (targetPath) {
-    const [parentDir, descriptor, name] = this.getPathDescriptor(targetPath, this.Cwd);
+    const [parentDir, descriptor, name] = this.getPathDescriptor(targetPath, this.Cwd, false);
 
     validatePathDoesNotExist(parentDir, descriptor, targetPath);
 
@@ -137,17 +195,25 @@ export class FileSystemEmulator {
     console.log(`Unlinking the file at path: '${ path }'`);
 
     try {
-      const [parentDirectory, targetDescriptor, fileName] = this.getPathDescriptor(path, this.Cwd);
+      const [parentDirectory, targetDescriptor, fileName] = this.getPathDescriptor(path, this.Cwd, false);
+
       validatePathExists(parentDirectory, targetDescriptor, path);
-      this.fs.removeHardLink(parentDirectory, fileName);
+
+      if (targetDescriptor instanceof SymbolicLink) {
+        console.log(`Unlinking symbolic link: '${ fileName }'`);
+        parentDirectory.links.delete(fileName);
+      } else if (targetDescriptor instanceof FileDirectory) {
+        throw new Error(`Cannot unlink a directory: '${ fileName }'`);
+      } else {
+        console.log(`Unlinking file: '${ fileName }'`);
+        this.fs.removeHardLink(parentDirectory, fileName);
+      }
     } catch (error) {
       console.error(error.message);
     }
   }
 
   ls (path = '') {
-    console.log(`Contents for path: '${ path }'`);
-
     try {
       const directoryDescriptor = this._resolveDirectoryDescriptor(path);
       this.fs.listDirectory(directoryDescriptor);
@@ -170,15 +236,132 @@ export class FileSystemEmulator {
     return targetDescriptor;
   }
 
-  _getCurrentDirectoryDescriptor () {
-    return this.cwdPath[this.cwdPath.length - 1];
+  mkdir (pathname) {
+    try {
+      const [parentDirectory, existingDescriptor, dirName] = this.getPathDescriptor(pathname, this.Cwd);
+      validatePathDoesNotExist(parentDirectory, existingDescriptor, pathname);
+
+      const newDirectory = new FileDirectory(parentDirectory);
+      parentDirectory.links.set(dirName, newDirectory);
+
+      newDirectory.hardlinkCount = 2;
+      parentDirectory.hardlinkCount++;
+
+      this.fs.fileDescriptorTable[newDirectory.id] = newDirectory;
+      console.log(`Directory '${ pathname }' created successfully.`);
+    } catch (error) {
+      console.error(error.message);
+    }
+  }
+
+  rmdir (pathname) {
+    try {
+      const [parentDirectory, existingDescriptor, dirName] = this.getPathDescriptor(pathname, this.Cwd);
+
+      if (!existingDescriptor || existingDescriptor.constructor !== FileDirectory) {
+        throw new Error(`Directory ${ pathname } does not exist or is not a directory`);
+      }
+
+      if (existingDescriptor.hardlinkCount > 2) {
+        throw new Error(`Directory ${ pathname } is not empty`);
+      }
+
+      parentDirectory.links.delete(dirName);
+      parentDirectory.hardlinkCount--;
+
+      FileDescriptor.returnIdToPool(existingDescriptor.id);
+
+      existingDescriptor.links.clear();
+      if (this.fs.fileDescriptorTable[existingDescriptor.id]) {
+        delete this.fs.fileDescriptorTable[existingDescriptor.id];
+      }
+
+      console.log(`Directory '${ pathname }' removed successfully.`);
+    } catch (error) {
+      console.error(error.message);
+    }
+  }
+
+  pwd () {
+    console.log(`Current working directory: '${ this._getPathFromDescriptor(this.Cwd) }'`);
+  }
+
+  cd (pathname) {
+    try {
+      const targetDescriptor = this._resolveDirectoryDescriptor(pathname);
+      this.Cwd = targetDescriptor;
+
+      this.cwdPath = this._getPathFromDescriptor(targetDescriptor).split('/').filter(Boolean);
+
+      console.log(`Current working directory changed to: '${ this.cwdPath.join('/') }'`);
+    } catch (error) {
+      console.error(error.message);
+    }
+  }
+
+  symlink (str, pathname) {
+    console.log(`Creating symbolic link at '${ pathname }' with target '${ str }'`);
+
+    try {
+      if (str.length > SIZE_OF_BLOCK) {
+        throw new Error(`Symbolic link content exceeds maximum allowed size of ${ SIZE_OF_BLOCK }`);
+      }
+
+      const targetInfo = this.getPathDescriptor(str, this.Cwd);
+      if (!targetInfo) {
+        throw new Error(`Target path '${ str }' does not exist.`);
+      }
+
+      const symlinkDescriptor = new SymbolicLink(str);
+      this.fs.fileDescriptorTable[symlinkDescriptor.id] = symlinkDescriptor;
+
+      const [parentDirectory, existingDescriptor, symlinkName] = this.getPathDescriptor(pathname, this.Cwd);
+      if (existingDescriptor) {
+        throw new Error(`Path '${ pathname }' already exists.`);
+      }
+
+      parentDirectory.links.set(symlinkName, symlinkDescriptor);
+      console.log(`Symbolic link '${ pathname }' created successfully.`);
+    } catch (error) {
+      console.error(error.message);
+    }
+  }
+
+  _getPathFromDescriptor (descriptor) {
+    if (!descriptor || descriptor === this.fs.rootDirectory) return '/';
+
+    const pathComponents = [];
+    let current = descriptor;
+
+    while (current && current !== this.fs.rootDirectory) {
+      const parent = current.parentDirectory;
+      let found = false;
+
+      for (const [name, childDescriptor] of parent.links) {
+        if (childDescriptor === current) {
+          pathComponents.unshift(name);
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        console.error('Descriptor not found in parent directory links!');
+        break;
+      }
+
+      current = parent;
+    }
+
+    return '/' + pathComponents.join('/');
   }
 
   stat (path) {
     try {
       const [parentDirectory, fileDescriptor] = this.getPathDescriptor(
         path,
-        this.cwdPath[this.cwdPath.length - 1],
+        this._getCurrentDirectoryDescriptor(),
+        false,
       );
       validatePathExists(parentDirectory, fileDescriptor, path);
       console.log(`${ fileDescriptor?.getStatistics() }`);
@@ -204,10 +387,8 @@ export class FileSystemEmulator {
   _getFileDescriptor (path) {
     const fileDescriptor = this.getPathDescriptor(
       path,
-      this.cwdPath[this.cwdPath.length - 1],
+      this._getCurrentDirectoryDescriptor(),
     )[1];
-
-    console.log(fileDescriptor.constructor.name);
 
     if (!fileDescriptor) throw new Error(`File not found: '${ path }'`);
 
@@ -273,5 +454,10 @@ export class FileSystemEmulator {
     } catch (e) {
       console.error(e.message);
     }
+  }
+
+  _getCurrentDirectoryDescriptor () {
+    if (!this.Cwd) throw new Error('Current working directory is not set.');
+    return this.Cwd;
   }
 }

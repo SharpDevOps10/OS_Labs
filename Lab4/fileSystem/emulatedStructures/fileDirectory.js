@@ -6,5 +6,6 @@ export class FileDirectory extends FileDescriptor {
     this.links = new Map();
     this.links.set('.', this);
     this.links.set('..', parentDescriptor || this);
+    this.parentDirectory = parentDescriptor || this;
   }
 }

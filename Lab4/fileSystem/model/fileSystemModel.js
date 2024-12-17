@@ -9,13 +9,15 @@ import { validateReadSize } from '../../utils/fsValidation/validateReadSize.js';
 import { validateReadAccess, validateWriteAccess } from '../fileAccess/validateAccess.js';
 import { validateWriteData } from '../../utils/fsValidation/validateWriteData.js';
 import { updateFileEntrySizeAndOffset } from '../calculations/updateFileEntrySizeAndOffset.js';
+import { SymbolicLink } from '../emulatedStructures/SymbolicLink.js';
 
-const SIZE_OF_BLOCK = 16;
+export const SIZE_OF_BLOCK = 128;
 
 export class FileSystemModel {
   constructor () {
     this.rootDirectory = new FileDirectory();
     this.fileDescriptorTable = {};
+    this.rootDirectory.hardlinkCount = 2;
   }
 
   findInDirectory (directory, fileName) {
@@ -53,7 +55,12 @@ export class FileSystemModel {
   listDirectory (directory) {
     for (const [fileName, fileDescriptor] of directory.links) {
       let output = `\t${ fileName } is ${ fileDescriptor.constructor.name }`;
-      if (fileDescriptor instanceof RegularFile || fileDescriptor instanceof FileDirectory) output += `, ID: ${ fileDescriptor.id }`;
+      if (fileDescriptor instanceof RegularFile || fileDescriptor instanceof FileDirectory || fileDescriptor instanceof SymbolicLink) {
+        output += `, ID: ${ fileDescriptor.id }`;
+      }
+      if (fileDescriptor instanceof SymbolicLink) {
+        output += `, points to: ${ fileDescriptor.value }`;
+      }
       console.log(output);
     }
   }
@@ -134,7 +141,7 @@ export class FileSystemModel {
     return readData;
   }
 
-  writeFile(fileDescriptorIndex, bytesToWrite, writeData) {
+  writeFile (fileDescriptorIndex, bytesToWrite, writeData) {
     const fileTableEntry = validateFileDescriptor(fileDescriptorIndex, this.fileDescriptorTable);
 
     validateWriteAccess(fileTableEntry);

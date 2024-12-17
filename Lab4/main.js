@@ -44,6 +44,11 @@ const commandList = new Map([
   ['link', ({ target, linkname }) => (target && linkname) ? fsEmul.link(target, linkname) : 'Usage: link <target> <linkname>'],
   ['unlink', ({ path }) => path ? fsEmul.unlink(path) : 'Usage: unlink <path>'],
   ['truncate', ({ path, length }) => (path && length) ? fsEmul.truncate(path, Number(length)) : 'Usage: truncate <path> <length>'],
+  ['mkdir', ({ pathname }) => pathname ? fsEmul.mkdir(pathname) : 'Usage: mkdir <pathname>'],
+  ['rmdir', ({ pathname }) => pathname ? fsEmul.rmdir(pathname) : 'Usage: rmdir <pathname>'],
+  ['cd', ({ pathname }) => pathname ? fsEmul.cd(pathname) : 'Usage: cd <pathname>'],
+  ['pwd', () => fsEmul.pwd()],
+  ['symlink', ({ str, pathname }) => str && pathname ? fsEmul.symlink(str, pathname) : 'Usage: symlink <target> <pathname>'],
 ]);
 
 const processCommand = async (input) => {
@@ -61,6 +66,11 @@ const processCommand = async (input) => {
     'link': ['target', 'linkname'],
     'unlink': ['path'],
     'truncate': ['path', 'length'],
+    'mkdir': ['pathname'],
+    'rmdir': ['pathname'],
+    'cd': ['pathname'],
+    'pwd': [],
+    'symlink': ['str', 'pathname'],
   };
 
   if (commandList.has(command)) {
